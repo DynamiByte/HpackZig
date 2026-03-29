@@ -61,6 +61,9 @@ fn addHpackExecutable(
     exe.root_module.addAnonymousImport("hpatchz_bin", .{
         .root_source_file = b.path(prebuiltToolRelPath(target, "hpatchz")),
     });
+    exe.root_module.addAnonymousImport("archive_tool_bin", .{
+        .root_source_file = b.path(prebuiltArchiveToolRelPath(target)),
+    });
     exe.root_module.addAnonymousImport("startup_banner_ansi", .{
         .root_source_file = b.path("src/banner_ansi.txt"),
     });
@@ -73,5 +76,13 @@ fn prebuiltToolRelPath(target: std.Build.ResolvedTarget, comptime tool_name: []c
         .windows => "deps/windows64/" ++ tool_name ++ ".exe",
         .linux => "deps/linux64/" ++ tool_name,
         else => @panic("unsupported prebuilt helper target"),
+    };
+}
+
+fn prebuiltArchiveToolRelPath(target: std.Build.ResolvedTarget) []const u8 {
+    return switch (target.result.os.tag) {
+        .windows => "deps/windows64/7za.exe",
+        .linux => "deps/linux64/7zz",
+        else => @panic("unsupported archive tool target"),
     };
 }

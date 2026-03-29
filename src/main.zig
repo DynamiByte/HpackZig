@@ -16,8 +16,10 @@ const readme_text =
 
 const embedded_hdiff = @embedFile("hdiffz_bin");
 const embedded_hpatch = @embedFile("hpatchz_bin");
+const embedded_archive_tool = @embedFile("archive_tool_bin");
 const hdiff_name = if (builtin.os.tag == .windows) "hdiffz.exe" else "hdiffz";
 const hpatch_name = if (builtin.os.tag == .windows) "hpatchz.exe" else "hpatchz";
+const archive_tool_name = if (builtin.os.tag == .windows) "7za.exe" else "7zz";
 
 const certain_games = [_][]const u8{
     "genshinimpact",
@@ -57,7 +59,7 @@ const PackageFile = struct {
 
 const ApplyOptions = struct {
     game_dir: []const u8,
-    zip_paths: [][]const u8,
+    archive_paths: [][]const u8,
     check_mode: CheckMode = .none,
     delete_packages: bool = false,
     executable_skip: bool = false,
@@ -78,6 +80,7 @@ const CreateOptions = struct {
     auto_version: bool = false,
     output_dir: []const u8 = ".",
     prefix: []const u8 = "game",
+    archive_type: []const u8 = "zip",
     reverse: bool = false,
     skip_check: bool = false,
     only_package: bool = false,
@@ -87,43 +90,129 @@ const CreateOptions = struct {
 };
 
 const FileProgress = struct {
-    root: std.Progress.Node,
+    io: Io,
+    root_name: []const u8,
+    root: std.Progress.Node = std.Progress.Node.none,
     phase: std.Progress.Node = std.Progress.Node.none,
+    phase_name: []const u8 = "",
     total_items: usize = 0,
+    completed_items: usize = 0,
+    current_name: []const u8 = "",
+    use_fallback: bool = false,
+    root_started: bool = false,
 
     fn init(io: Io, root_name: []const u8) FileProgress {
         return .{
-            .root = std.Progress.start(io, .{ .root_name = root_name }),
+            .io = io,
+            .root_name = root_name,
         };
     }
 
     fn deinit(self: *FileProgress) void {
         self.finishPhase();
-        self.root.end();
+        if (self.root.index != .none) self.root.end();
+    }
+
+    fn beginStage(self: *FileProgress, name: []const u8) void {
+        self.beginPhaseInternal(name, 0);
     }
 
     fn beginPhase(self: *FileProgress, name: []const u8, total_items: usize) void {
-        self.finishPhase();
-        self.total_items = total_items;
-        self.phase = self.root.start(name, total_items);
+        self.beginPhaseInternal(name, total_items);
     }
 
     fn setCurrent(self: *FileProgress, name: []const u8) void {
-        if (self.phase.index == .none) return;
-        self.phase.setName(name);
+        self.current_name = name;
+        if (self.phase.index != .none) self.phase.setName(name);
+        self.renderFallbackCurrent();
     }
 
     fn completeOne(self: *FileProgress) void {
-        if (self.phase.index == .none) return;
-        self.phase.completeOne();
+        if (self.completed_items < self.total_items) self.completed_items += 1;
+        self.current_name = "";
+        if (self.phase.index != .none) self.phase.completeOne();
     }
 
     fn finishPhase(self: *FileProgress) void {
-        if (self.phase.index == .none) return;
-        self.phase.setCompletedItems(self.total_items);
-        self.phase.end();
+        if (self.use_fallback and self.phase_name.len != 0) {
+            if (self.total_items == 0) {
+                std.debug.print("[progress] {s} {s} done\n", .{
+                    self.root_name,
+                    self.phase_name,
+                });
+            } else {
+                std.debug.print("[progress] {s} {s} {d}/{d}\n", .{
+                    self.root_name,
+                    self.phase_name,
+                    self.total_items,
+                    self.total_items,
+                });
+            }
+        }
+        if (self.phase.index != .none) {
+            self.phase.setCompletedItems(self.total_items);
+            self.phase.end();
+        }
         self.phase = std.Progress.Node.none;
+        self.phase_name = "";
         self.total_items = 0;
+        self.completed_items = 0;
+        self.current_name = "";
+    }
+
+    fn beginPhaseInternal(self: *FileProgress, name: []const u8, total_items: usize) void {
+        self.finishPhase();
+        self.ensureRoot();
+        self.phase_name = name;
+        self.total_items = total_items;
+        self.completed_items = 0;
+        self.current_name = "";
+        if (self.root.index != .none) {
+            self.phase = self.root.start(name, total_items);
+        }
+        self.renderFallbackPhaseStart();
+    }
+
+    fn ensureRoot(self: *FileProgress) void {
+        if (self.root_started) return;
+        self.root_started = true;
+        self.root = std.Progress.start(self.io, .{ .root_name = self.root_name });
+        self.use_fallback = self.root.index == .none;
+    }
+
+    fn renderFallbackPhaseStart(self: *const FileProgress) void {
+        if (!self.use_fallback) return;
+        if (self.total_items == 0) {
+            std.debug.print("[progress] {s} {s}\n", .{
+                self.root_name,
+                self.phase_name,
+            });
+        } else {
+            std.debug.print("[progress] {s} {s} 0/{d}\n", .{
+                self.root_name,
+                self.phase_name,
+                self.total_items,
+            });
+        }
+    }
+
+    fn renderFallbackCurrent(self: *const FileProgress) void {
+        if (!self.use_fallback) return;
+        if (self.total_items == 0) {
+            std.debug.print("[progress] {s} {s}: {s}\n", .{
+                self.root_name,
+                self.phase_name,
+                self.current_name,
+            });
+        } else {
+            std.debug.print("[progress] {s} {s} {d}/{d} {s}\n", .{
+                self.root_name,
+                self.phase_name,
+                self.completed_items + 1,
+                self.total_items,
+                self.current_name,
+            });
+        }
     }
 };
 
@@ -136,6 +225,7 @@ const App = struct {
     temp_counter: usize = 0,
     hdiff_path: ?[]const u8 = null,
     hpatch_path: ?[]const u8 = null,
+    archive_tool_path: ?[]const u8 = null,
 
     fn deinit(self: *App) void {
         var i = self.temp_paths.items.len;
@@ -148,7 +238,7 @@ const App = struct {
     }
 
     fn ensureTools(self: *App) !void {
-        if (self.hdiff_path != null and self.hpatch_path != null) return;
+        if (self.hdiff_path != null and self.hpatch_path != null and self.archive_tool_path != null) return;
 
         const temp_root = self.env.get("TEMP") orelse
             self.env.get("TMP") orelse
@@ -158,20 +248,26 @@ const App = struct {
 
         const hdiff_base = try std.fmt.allocPrint(self.arena, "hpackzig_{d}_{s}", .{ self.temp_counter, hdiff_name });
         const hpatch_base = try std.fmt.allocPrint(self.arena, "hpackzig_{d}_{s}", .{ self.temp_counter, hpatch_name });
+        const archive_tool_base = try std.fmt.allocPrint(self.arena, "hpackzig_{d}_{s}", .{ self.temp_counter, archive_tool_name });
 
         const hdiff_path = try std.fs.path.join(self.arena, &.{ temp_root, hdiff_base });
         const hpatch_path = try std.fs.path.join(self.arena, &.{ temp_root, hpatch_base });
+        const archive_tool_path = try std.fs.path.join(self.arena, &.{ temp_root, archive_tool_base });
 
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = hdiff_path, .data = embedded_hdiff });
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = hpatch_path, .data = embedded_hpatch });
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = archive_tool_path, .data = embedded_archive_tool });
         try makeExecutableIfNeeded(self.io, hdiff_path);
         try makeExecutableIfNeeded(self.io, hpatch_path);
+        try makeExecutableIfNeeded(self.io, archive_tool_path);
 
         try self.temp_paths.append(self.arena, hdiff_path);
         try self.temp_paths.append(self.arena, hpatch_path);
+        try self.temp_paths.append(self.arena, archive_tool_path);
 
         self.hdiff_path = hdiff_path;
         self.hpatch_path = hpatch_path;
+        self.archive_tool_path = archive_tool_path;
     }
 
     fn makeTempDir(self: *App, parent: []const u8, label: []const u8) ![]const u8 {
@@ -181,6 +277,17 @@ const App = struct {
         try std.Io.Dir.cwd().createDirPath(self.io, path);
         try self.temp_paths.append(self.arena, path);
         return path;
+    }
+
+    fn tempRoot(self: *App) []const u8 {
+        return self.env.get("TEMP") orelse
+            self.env.get("TMP") orelse
+            self.env.get("TMPDIR") orelse
+            if (builtin.os.tag == .windows) "." else "/tmp";
+    }
+
+    fn makeSystemTempDir(self: *App, label: []const u8) ![]const u8 {
+        return self.makeTempDir(self.tempRoot(), label);
     }
 };
 
@@ -213,7 +320,7 @@ fn run(app: *App, args: []const [:0]const u8) !u8 {
     if (std.mem.eql(u8, command, "apply")) {
         var opts = try parseApplyOptions(app.arena, args[2..]);
         opts.game_dir = try makeAbsolute(app.arena, app.io, opts.game_dir);
-        for (opts.zip_paths) |*zip_path| zip_path.* = try makeAbsolute(app.arena, app.io, zip_path.*);
+        for (opts.archive_paths) |*archive_path| archive_path.* = try makeAbsolute(app.arena, app.io, archive_path.*);
         try validateGameDir(app.io, opts.game_dir, opts.executable_skip);
         return if (try applyUpdates(app, opts)) 0 else 1;
     }
@@ -229,8 +336,6 @@ fn run(app: *App, args: []const [:0]const u8) !u8 {
         opts.from_dir = try makeAbsolute(app.arena, app.io, opts.from_dir);
         opts.to_dir = try makeAbsolute(app.arena, app.io, opts.to_dir);
         opts.output_dir = try makeAbsolute(app.arena, app.io, opts.output_dir);
-        try validateGameDir(app.io, opts.from_dir, opts.executable_skip);
-        try validateGameDir(app.io, opts.to_dir, opts.executable_skip);
         const created = createPackages(app, opts) catch |e| switch (e) {
             error.VersionDetectFailed => {
                 errorLog("Error auto detecting version from game folders, specify --version-change manually.");
@@ -238,6 +343,14 @@ fn run(app: *App, args: []const [:0]const u8) !u8 {
             },
             error.InvalidVersionString => {
                 errorLog("Error parsing version, it must be on format 'x.x.x.x'.");
+                return 1;
+            },
+            error.ArchiveCreateFailed => {
+                errorLog("Error creating output archive for patch package.");
+                return 1;
+            },
+            error.ArchiveExtractFailed => {
+                errorLog("Error extracting archive input for create.");
                 return 1;
             },
             else => return e,
@@ -256,9 +369,9 @@ fn run(app: *App, args: []const [:0]const u8) !u8 {
 fn parseApplyOptions(arena: Allocator, args: []const [:0]const u8) !ApplyOptions {
     var opts = ApplyOptions{
         .game_dir = "",
-        .zip_paths = &.{},
+        .archive_paths = &.{},
     };
-    var zips: std.ArrayList([]const u8) = .empty;
+    var archives: std.ArrayList([]const u8) = .empty;
 
     var i: usize = 0;
     while (i < args.len) {
@@ -267,10 +380,10 @@ fn parseApplyOptions(arena: Allocator, args: []const [:0]const u8) !ApplyOptions
             i += 1;
             if (i >= args.len) return error.MissingGameDir;
             opts.game_dir = args[i];
-        } else if (matches(arg, "--zips", "-z")) {
+        } else if (std.mem.eql(u8, arg, "--archives") or matches(arg, "--zips", "-z")) {
             i += 1;
             while (i < args.len and !looksLikeFlag(args[i])) : (i += 1) {
-                try zips.append(arena, args[i]);
+                try archives.append(arena, args[i]);
             }
             continue;
         } else if (matches(arg, "--check-mode", "-c")) {
@@ -288,8 +401,8 @@ fn parseApplyOptions(arena: Allocator, args: []const [:0]const u8) !ApplyOptions
     }
 
     if (opts.game_dir.len == 0) return error.MissingGameDir;
-    if (zips.items.len == 0) return error.MissingZipFiles;
-    opts.zip_paths = try zips.toOwnedSlice(arena);
+    if (archives.items.len == 0) return error.MissingArchives;
+    opts.archive_paths = try archives.toOwnedSlice(arena);
     return opts;
 }
 
@@ -355,6 +468,10 @@ fn parseCreateOptions(args: []const [:0]const u8) !CreateOptions {
             i += 1;
             if (i >= args.len) return error.MissingPrefix;
             opts.prefix = args[i];
+        } else if (std.mem.eql(u8, arg, "--archive-type") or std.mem.eql(u8, arg, "--archivetype")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArchiveType;
+            opts.archive_type = args[i];
         } else if (matches(arg, "--reverse", "-r")) {
             opts.reverse = true;
         } else if (std.mem.eql(u8, arg, "--skipCheck") or std.mem.eql(u8, arg, "-s")) {
@@ -466,13 +583,15 @@ fn printUsage() void {
         \\HPack Zig
         \\
         \\Commands:
-        \\  hpack apply --game-dir <path> --zips <zip...> [--check-mode None|Basic|Full] [--delete-packages] [-e]
+        \\  hpack apply --game-dir <path> (--archives <file...> | --zips <file...>) [--check-mode None|Basic|Full] [--delete-packages] [-e]
         \\  hpack check --game-dir <path> [--check-mode None|Basic|Full] [--output <dir>] [-e]
-        \\  hpack create --from <old> --to <new> (--auto-version | --version-change <old> <new>) [options]
+        \\  hpack create --from <old-dir-or-archive> --to <new-dir-or-archive> (--auto-version | --version-change <old> <new>) [options]
         \\
         \\Create options:
         \\  --output, -o <dir>
         \\  --prefix, -p <name>
+        \\  --archive-type, --archivetype <type>
+        \\    [zip (default) | 7z | tar | gzip | bzip2 | xz]
         \\  --reverse, -r
         \\  --skipCheck, -s
         \\  --only-include-pkg-defined-files, -d
@@ -508,11 +627,13 @@ fn warnFmt(comptime fmt: []const u8, args: anytype) void {
 }
 
 fn applyUpdates(app: *App, opts: ApplyOptions) !bool {
-    try app.ensureTools();
-
     var progress = FileProgress.init(app.io, "apply");
     defer progress.deinit();
 
+    progress.beginStage("Preparing tools");
+    try app.ensureTools();
+
+    progress.beginStage("Backing up version files");
     const backup_dir = try app.makeTempDir(opts.game_dir, "backup");
     const pkg_paths = try getPkgVersionPaths(app.arena, app.io, opts.game_dir, true);
 
@@ -525,13 +646,15 @@ fn applyUpdates(app: *App, opts: ApplyOptions) !bool {
     var delete_delays: std.ArrayList([]const u8) = .empty;
     defer delete_delays.deinit(app.arena);
 
-    for (opts.zip_paths) |zip_path| {
-        infoFmt("Applying {s}", .{zip_path});
+    for (opts.archive_paths) |archive_path| {
+        infoFmt("Applying {s}", .{archive_path});
         const extract_dir = try app.makeTempDir(opts.game_dir, "extract");
-        extractArchive(app.io, zip_path, extract_dir) catch {
-            warnFmt("The file {s} is not a zip file.", .{zip_path});
+        const extract_phase = try std.fmt.allocPrint(app.arena, "Extracting {s}", .{std.fs.path.basename(archive_path)});
+        progress.beginStage(extract_phase);
+        if (!try extractArchive(app, archive_path, extract_dir)) {
+            warnFmt("The file {s} is not a supported archive or failed to extract.", .{archive_path});
             continue;
-        };
+        }
 
         var hdiff_names = try readRemoteNameSet(app.arena, app.io, extract_dir, "hdifffiles.txt");
         defer hdiff_names.deinit();
@@ -540,7 +663,7 @@ fn applyUpdates(app: *App, opts: ApplyOptions) !bool {
         var package_files = try collectPackageFiles(app.arena, app.io, extract_dir);
         defer package_files.deinit(app.arena);
 
-        progress.beginPhase(std.fs.path.basename(zip_path), delete_list.items.len + package_files.items.len);
+        progress.beginPhase(std.fs.path.basename(archive_path), delete_list.items.len + package_files.items.len);
 
         for (delete_list.items) |delete_rel_slash| {
             progress.setCurrent(delete_rel_slash);
@@ -619,12 +742,23 @@ fn createPackages(app: *App, opts: CreateOptions) !bool {
     var progress = FileProgress.init(app.io, "create");
     defer progress.deinit();
 
+    const from_input_is_dir = isDirectory(app.io, opts.from_dir);
+    const to_input_is_dir = isDirectory(app.io, opts.to_dir);
+    if (!from_input_is_dir or !to_input_is_dir) {
+        progress.beginStage("Preparing tools");
+        try app.ensureTools();
+    }
+
+    const from_root = try resolveCreateInputDir(app, &progress, opts.from_dir, "old", opts.executable_skip);
+    const to_root = try resolveCreateInputDir(app, &progress, opts.to_dir, "new", opts.executable_skip);
+
     var version_from = opts.version_from;
     var version_to = opts.version_to;
 
     if (opts.auto_version) {
-        version_from = try autoDetectVersion(app.arena, app.io, opts.from_dir);
-        version_to = try autoDetectVersion(app.arena, app.io, opts.to_dir);
+        progress.beginStage("Detecting versions");
+        version_from = try autoDetectVersion(app.arena, app.io, from_root);
+        version_to = try autoDetectVersion(app.arena, app.io, to_root);
     } else if (version_from == null or version_to == null) {
         return error.MissingVersionChange;
     }
@@ -635,12 +769,12 @@ fn createPackages(app: *App, opts: CreateOptions) !bool {
 
     if (!opts.skip_check) {
         info("Checking old version game files");
-        if (!try doCheck(app, opts.from_dir, .basic, null, &progress)) {
+        if (!try doCheck(app, from_root, .basic, null, &progress)) {
             errorLog("Original files not correct.");
             return false;
         }
         info("Checking new version game files");
-        if (!try doCheck(app, opts.to_dir, .basic, null, &progress)) {
+        if (!try doCheck(app, to_root, .basic, null, &progress)) {
             errorLog("Original files not correct.");
             return false;
         }
@@ -652,39 +786,55 @@ fn createPackages(app: *App, opts: CreateOptions) !bool {
     defer if (allowed_to) |*m| m.deinit();
 
     if (opts.only_package) {
-        var old_pkg_versions = try getPkgVersionPaths(app.arena, app.io, opts.from_dir, opts.include_audios);
+        var old_pkg_versions = try getPkgVersionPaths(app.arena, app.io, from_root, opts.include_audios);
         defer old_pkg_versions.deinit(app.arena);
-        var new_pkg_versions = try getPkgVersionPaths(app.arena, app.io, opts.to_dir, opts.include_audios);
+        var new_pkg_versions = try getPkgVersionPaths(app.arena, app.io, to_root, opts.include_audios);
         defer new_pkg_versions.deinit(app.arena);
         if (old_pkg_versions.items.len == 0 or new_pkg_versions.items.len == 0) {
             warn("Can't find pkg_version file. No files are selected.");
             return true;
         }
-        allowed_from = try collectAllowedFiles(app.arena, app.io, opts.from_dir, opts.include_audios);
-        allowed_to = try collectAllowedFiles(app.arena, app.io, opts.to_dir, opts.include_audios);
+        progress.beginStage("Loading pkg-defined file list");
+        allowed_from = try collectAllowedFiles(app.arena, app.io, from_root, opts.include_audios);
+        allowed_to = try collectAllowedFiles(app.arena, app.io, to_root, opts.include_audios);
     }
 
-    var from_files = try enumerateFiles(app.arena, app.io, opts.from_dir, if (allowed_from) |*m| m else null);
+    progress.beginStage("Enumerating old files");
+    var from_files = try enumerateFiles(app.arena, app.io, from_root, if (allowed_from) |*m| m else null);
     defer from_files.deinit();
-    var to_files = try enumerateFiles(app.arena, app.io, opts.to_dir, if (allowed_to) |*m| m else null);
+    progress.beginStage("Enumerating new files");
+    var to_files = try enumerateFiles(app.arena, app.io, to_root, if (allowed_to) |*m| m else null);
     defer to_files.deinit();
 
+    progress.beginStage("Comparing file lists");
     if (!opts.force_equal and try fileMapsEqual(app, &from_files, &to_files)) {
         warn("The two folders are identical. Use --force to create a package anyway.");
         return false;
     }
 
+    if (from_input_is_dir and to_input_is_dir) progress.beginStage("Preparing tools");
     try app.ensureTools();
+    progress.beginStage("Preparing output");
     try std.Io.Dir.cwd().createDirPath(app.io, opts.output_dir);
 
-    const main_name = try std.fmt.allocPrint(app.arena, "{s}_{s}_{s}_hdiff.zip", .{ opts.prefix, version_from.?, version_to.? });
+    const main_name = try std.fmt.allocPrint(app.arena, "{s}_{s}_{s}_hdiff.{s}", .{
+        opts.prefix,
+        version_from.?,
+        version_to.?,
+        opts.archive_type,
+    });
     const main_out = try std.fs.path.join(app.arena, &.{ opts.output_dir, main_name });
-    try createDiffPackage(app, &progress, &from_files, &to_files, main_out);
+    try createDiffPackage(app, &progress, &from_files, &to_files, main_out, opts.archive_type);
 
     if (opts.reverse) {
-        const reverse_name = try std.fmt.allocPrint(app.arena, "{s}_{s}_{s}_hdiff.zip", .{ opts.prefix, version_to.?, version_from.? });
+        const reverse_name = try std.fmt.allocPrint(app.arena, "{s}_{s}_{s}_hdiff.{s}", .{
+            opts.prefix,
+            version_to.?,
+            version_from.?,
+            opts.archive_type,
+        });
         const reverse_out = try std.fs.path.join(app.arena, &.{ opts.output_dir, reverse_name });
-        try createDiffPackage(app, &progress, &to_files, &from_files, reverse_out);
+        try createDiffPackage(app, &progress, &to_files, &from_files, reverse_out, opts.archive_type);
     }
 
     return true;
@@ -695,10 +845,11 @@ fn createDiffPackage(
     progress: *FileProgress,
     from_files: *std.StringHashMap(FileRecord),
     to_files: *std.StringHashMap(FileRecord),
-    output_zip_path: []const u8,
+    output_archive_path: []const u8,
+    archive_type: []const u8,
 ) !void {
-    infoFmt("Creating {s}", .{output_zip_path});
-    const output_parent = std.fs.path.dirname(output_zip_path) orelse ".";
+    infoFmt("Creating {s}", .{output_archive_path});
+    const output_parent = std.fs.path.dirname(output_archive_path) orelse ".";
     const temp_dir = try app.makeTempDir(output_parent, "package");
 
     var delete_lines: std.ArrayList([]const u8) = .empty;
@@ -727,7 +878,7 @@ fn createDiffPackage(
         }
     }
 
-    progress.beginPhase(std.fs.path.basename(output_zip_path), delete_count + copy_count + common_count);
+    progress.beginPhase(std.fs.path.basename(output_archive_path), delete_count + copy_count + common_count);
 
     from_it = from_files.iterator();
     while (from_it.next()) |entry| {
@@ -794,7 +945,7 @@ fn createDiffPackage(
     try std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = try std.fs.path.join(app.arena, &.{ temp_dir, "hdifffiles.txt" }), .data = hdiff_text });
     try std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = try std.fs.path.join(app.arena, &.{ temp_dir, "README.txt" }), .data = readme_text });
 
-    try writeStoreArchive(app.arena, app.io, temp_dir, output_zip_path);
+    try writePackageArchive(app, temp_dir, output_archive_path, archive_type);
 }
 
 fn copyIntoPackage(app: *App, package_dir: []const u8, record: FileRecord) !void {
@@ -917,6 +1068,7 @@ fn doCheck(
     if (mode == .none) return true;
     defer if (progress) |p| p.finishPhase();
 
+    if (progress) |p| p.beginStage("Finding version files");
     var pkg_paths = try getPkgVersionPaths(app.arena, app.io, dir_path, true);
     defer pkg_paths.deinit(app.arena);
 
@@ -1116,15 +1268,75 @@ fn runPatchTool(app: *App, from_path: []const u8, diff_path: []const u8, to_path
     };
 }
 
-fn extractArchive(io: Io, zip_path: []const u8, dest_dir: []const u8) !void {
-    var file = try std.Io.Dir.cwd().openFile(io, zip_path, .{});
-    defer file.close(io);
-    var reader_buf: [64 * 1024]u8 = undefined;
-    var reader = file.reader(io, &reader_buf);
+fn extractArchive(app: *App, archive_path: []const u8, dest_dir: []const u8) !bool {
+    const output_arg = try std.fmt.allocPrint(app.arena, "-o{s}", .{dest_dir});
+    const argv = [_][]const u8{
+        app.archive_tool_path.?,
+        "x",
+        "-y",
+        "-aoa",
+        output_arg,
+        archive_path,
+    };
+    const result = std.process.run(app.gpa, app.io, .{ .argv = &argv }) catch return false;
+    defer app.gpa.free(result.stdout);
+    defer app.gpa.free(result.stderr);
+    return switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
 
-    var dest = try std.Io.Dir.openDirAbsolute(io, dest_dir, .{});
-    defer dest.close(io);
-    try std.zip.extract(dest, &reader, .{ .allow_backslashes = true });
+fn resolveCreateInputDir(
+    app: *App,
+    progress: *FileProgress,
+    input_path: []const u8,
+    comptime label: []const u8,
+    executable_skip: bool,
+) ![]const u8 {
+    if (isDirectory(app.io, input_path)) {
+        try validateGameDir(app.io, input_path, executable_skip);
+        return input_path;
+    }
+
+    if (!pathExists(app.io, input_path)) return error.FileNotFound;
+
+    const phase_name = try std.fmt.allocPrint(app.arena, "Extracting {s} archive {s}", .{
+        label,
+        std.fs.path.basename(input_path),
+    });
+    progress.beginStage(phase_name);
+
+    const extract_dir = try app.makeSystemTempDir(label ++ "_archive");
+    if (!try extractArchive(app, input_path, extract_dir)) return error.ArchiveExtractFailed;
+
+    const root_dir = try unwrapSingleRootDir(app.arena, app.io, extract_dir);
+    try validateGameDir(app.io, root_dir, executable_skip);
+    return root_dir;
+}
+
+fn unwrapSingleRootDir(arena: Allocator, io: Io, dir_path: []const u8) ![]const u8 {
+    var current = dir_path;
+
+    while (true) {
+        var dir = try std.Io.Dir.openDirAbsolute(io, current, .{ .iterate = true });
+        defer dir.close(io);
+
+        var iter = dir.iterate();
+        var only_dir_name: ?[]const u8 = null;
+        var entry_count: usize = 0;
+
+        while (try iter.next(io)) |entry| {
+            if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+            entry_count += 1;
+            if (entry_count > 1) return current;
+            if (entry.kind != .directory) return current;
+            only_dir_name = try arena.dupe(u8, entry.name);
+        }
+
+        const dir_name = only_dir_name orelse return current;
+        current = try std.fs.path.join(arena, &.{ current, dir_name });
+    }
 }
 
 fn getPkgVersionPaths(arena: Allocator, io: Io, dir_path: []const u8, include_audios: bool) !std.ArrayList([]const u8) {
@@ -1240,6 +1452,12 @@ fn makeAbsolute(arena: Allocator, io: Io, path: []const u8) ![]const u8 {
     if (std.fs.path.isAbsolute(path)) return try arena.dupe(u8, path);
     const cwd = try std.process.currentPathAlloc(io, arena);
     return try std.fs.path.resolve(arena, &.{ cwd, path });
+}
+
+fn isDirectory(io: Io, path: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, path, .{}) catch return false;
+    defer dir.close(io);
+    return true;
 }
 
 fn pathExists(io: Io, path: []const u8) bool {
@@ -1396,6 +1614,51 @@ fn writeStoreArchive(
         zipU32Legacy(central_dir_offset),
     );
     try writer.interface.flush();
+}
+
+fn writePackageArchive(
+    app: *App,
+    source_dir_path: []const u8,
+    output_archive_path: []const u8,
+    archive_type: []const u8,
+) !void {
+    if (std.ascii.eqlIgnoreCase(archive_type, "zip")) {
+        try writeStoreArchive(app.arena, app.io, source_dir_path, output_archive_path);
+        return;
+    }
+
+    if (!try writeArchiveWithTool(app, source_dir_path, output_archive_path, archive_type)) {
+        return error.ArchiveCreateFailed;
+    }
+}
+
+fn writeArchiveWithTool(
+    app: *App,
+    source_dir_path: []const u8,
+    output_archive_path: []const u8,
+    archive_type: []const u8,
+) !bool {
+    deleteBestEffort(app.io, output_archive_path);
+
+    const type_arg = try std.fmt.allocPrint(app.arena, "-t{s}", .{archive_type});
+    const argv = [_][]const u8{
+        app.archive_tool_path.?,
+        "a",
+        type_arg,
+        "-y",
+        output_archive_path,
+        "*",
+    };
+    const result = std.process.run(app.gpa, app.io, .{
+        .argv = &argv,
+        .cwd = .{ .path = source_dir_path },
+    }) catch return false;
+    defer app.gpa.free(result.stdout);
+    defer app.gpa.free(result.stderr);
+    return switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
 }
 
 fn normalizeZipPath(arena: Allocator, native_rel: []const u8) ![]const u8 {
