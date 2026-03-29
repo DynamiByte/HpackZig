@@ -19,7 +19,7 @@ This relies on prebuilt binaries of [HDiffPatch](https://github.com/sisong/HDiff
 They are bundled under `./deps`
 
 If you want a different startup banner, replace `src/banner_ansi.txt`.
-`./banner_ansi_alt.txt` is an extra banner asset in the repo, but it is not used automatically.
+`./banner_ansi_alt.txt` is an extra banner asset in the repo if you want to use that. :yuzuha_doro:
 
 Build outputs:
 
