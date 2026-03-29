@@ -235,7 +235,7 @@ fn parseApplyOptions(arena: Allocator, args: []const [:0]const u8) !ApplyOptions
             opts.delete_packages = true;
         } else if (matches(arg, "--executable-skip", "-e")) {
             opts.executable_skip = true;
-        } else {
+        } else if (try parseApplyShortFlagGroup(arg, &opts)) {} else {
             return error.UnknownArgument;
         }
         i += 1;
@@ -267,7 +267,7 @@ fn parseCheckOptions(args: []const [:0]const u8) !CheckOptions {
             opts.output_dir = args[i];
         } else if (matches(arg, "--executable-skip", "-e")) {
             opts.executable_skip = true;
-        } else {
+        } else if (try parseCheckShortFlagGroup(arg, &opts)) {} else {
             return error.UnknownArgument;
         }
         i += 1;
@@ -321,7 +321,7 @@ fn parseCreateOptions(args: []const [:0]const u8) !CreateOptions {
             opts.force_equal = true;
         } else if (matches(arg, "--executable-skip", "-e")) {
             opts.executable_skip = true;
-        } else {
+        } else if (try parseCreateShortFlagGroup(arg, &opts)) {} else {
             return error.UnknownArgument;
         }
         i += 1;
@@ -330,6 +330,45 @@ fn parseCreateOptions(args: []const [:0]const u8) !CreateOptions {
     if (opts.from_dir.len == 0) return error.MissingFromDir;
     if (opts.to_dir.len == 0) return error.MissingToDir;
     return opts;
+}
+
+fn parseApplyShortFlagGroup(arg: []const u8, opts: *ApplyOptions) !bool {
+    if (!isShortFlagGroup(arg)) return false;
+
+    for (arg[1..]) |flag| switch (flag) {
+        'r' => opts.delete_packages = true,
+        'e' => opts.executable_skip = true,
+        'd', 'z', 'c' => return error.ShortFlagRequiresSeparateArgument,
+        else => return error.UnknownArgument,
+    };
+    return true;
+}
+
+fn parseCheckShortFlagGroup(arg: []const u8, opts: *CheckOptions) !bool {
+    if (!isShortFlagGroup(arg)) return false;
+
+    for (arg[1..]) |flag| switch (flag) {
+        'e' => opts.executable_skip = true,
+        'd', 'c', 'o' => return error.ShortFlagRequiresSeparateArgument,
+        else => return error.UnknownArgument,
+    };
+    return true;
+}
+
+fn parseCreateShortFlagGroup(arg: []const u8, opts: *CreateOptions) !bool {
+    if (!isShortFlagGroup(arg)) return false;
+
+    for (arg[1..]) |flag| switch (flag) {
+        'a' => opts.auto_version = true,
+        'r' => opts.reverse = true,
+        's' => opts.skip_check = true,
+        'd' => opts.only_package = true,
+        'i' => opts.include_audios = true,
+        'e' => opts.executable_skip = true,
+        'f', 't', 'c', 'o', 'p' => return error.ShortFlagRequiresSeparateArgument,
+        else => return error.UnknownArgument,
+    };
+    return true;
 }
 
 fn runCheckCommand(app: *App, opts: CheckOptions) !bool {
@@ -360,6 +399,10 @@ fn matches(arg: []const u8, long: []const u8, short: []const u8) bool {
 
 fn looksLikeFlag(arg: []const u8) bool {
     return arg.len > 0 and arg[0] == '-';
+}
+
+fn isShortFlagGroup(arg: []const u8) bool {
+    return arg.len > 2 and arg[0] == '-' and arg[1] != '-';
 }
 
 fn parseCheckMode(text: []const u8) !CheckMode {
