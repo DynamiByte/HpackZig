@@ -50,6 +50,11 @@ const FileRecord = struct {
     md5_hex: ?[32]u8 = null,
 };
 
+const PackageFile = struct {
+    native_rel: []const u8,
+    rel_slash: []const u8,
+};
+
 const ApplyOptions = struct {
     game_dir: []const u8,
     zip_paths: [][]const u8,
@@ -79,6 +84,47 @@ const CreateOptions = struct {
     include_audios: bool = false,
     force_equal: bool = false,
     executable_skip: bool = false,
+};
+
+const FileProgress = struct {
+    root: std.Progress.Node,
+    phase: std.Progress.Node = std.Progress.Node.none,
+    total_items: usize = 0,
+
+    fn init(io: Io, root_name: []const u8) FileProgress {
+        return .{
+            .root = std.Progress.start(io, .{ .root_name = root_name }),
+        };
+    }
+
+    fn deinit(self: *FileProgress) void {
+        self.finishPhase();
+        self.root.end();
+    }
+
+    fn beginPhase(self: *FileProgress, name: []const u8, total_items: usize) void {
+        self.finishPhase();
+        self.total_items = total_items;
+        self.phase = self.root.start(name, total_items);
+    }
+
+    fn setCurrent(self: *FileProgress, name: []const u8) void {
+        if (self.phase.index == .none) return;
+        self.phase.setName(name);
+    }
+
+    fn completeOne(self: *FileProgress) void {
+        if (self.phase.index == .none) return;
+        self.phase.completeOne();
+    }
+
+    fn finishPhase(self: *FileProgress) void {
+        if (self.phase.index == .none) return;
+        self.phase.setCompletedItems(self.total_items);
+        self.phase.end();
+        self.phase = std.Progress.Node.none;
+        self.total_items = 0;
+    }
 };
 
 const App = struct {
@@ -372,10 +418,13 @@ fn parseCreateShortFlagGroup(arg: []const u8, opts: *CreateOptions) !bool {
 }
 
 fn runCheckCommand(app: *App, opts: CheckOptions) !bool {
+    var progress = FileProgress.init(app.io, "check");
+    defer progress.deinit();
+
     var bad_files: std.ArrayList([]const u8) = .empty;
     defer bad_files.deinit(app.arena);
 
-    const passed = try doCheck(app, opts.game_dir, opts.check_mode, &bad_files);
+    const passed = try doCheck(app, opts.game_dir, opts.check_mode, &bad_files, &progress);
     if (passed) {
         info("All files are correct.");
     } else {
@@ -461,6 +510,9 @@ fn warnFmt(comptime fmt: []const u8, args: anytype) void {
 fn applyUpdates(app: *App, opts: ApplyOptions) !bool {
     try app.ensureTools();
 
+    var progress = FileProgress.init(app.io, "apply");
+    defer progress.deinit();
+
     const backup_dir = try app.makeTempDir(opts.game_dir, "backup");
     const pkg_paths = try getPkgVersionPaths(app.arena, app.io, opts.game_dir, true);
 
@@ -485,8 +537,13 @@ fn applyUpdates(app: *App, opts: ApplyOptions) !bool {
         defer hdiff_names.deinit();
         var delete_list = try readPlainLinesFromFile(app.arena, app.io, extract_dir, "deletefiles.txt");
         defer delete_list.deinit(app.arena);
+        var package_files = try collectPackageFiles(app.arena, app.io, extract_dir);
+        defer package_files.deinit(app.arena);
+
+        progress.beginPhase(std.fs.path.basename(zip_path), delete_list.items.len + package_files.items.len);
 
         for (delete_list.items) |delete_rel_slash| {
+            progress.setCurrent(delete_rel_slash);
             const delete_rel_native = try slashToNative(app.arena, delete_rel_slash);
             const delete_abs = try std.fs.path.join(app.arena, &.{ opts.game_dir, delete_rel_native });
             if (pathExists(app.io, delete_abs)) {
@@ -494,30 +551,26 @@ fn applyUpdates(app: *App, opts: ApplyOptions) !bool {
             } else {
                 try delete_delays.append(app.arena, delete_abs);
             }
+            progress.completeOne();
         }
 
-        var extracted_dir = try std.Io.Dir.openDirAbsolute(app.io, extract_dir, .{ .iterate = true });
-        defer extracted_dir.close(app.io);
-
-        var walker = try extracted_dir.walk(app.arena);
-        defer walker.deinit();
-
-        while (try walker.next(app.io)) |entry| {
-            if (entry.kind != .file) continue;
-
-            const rel_slash = try normalizeRelativePath(app.arena, entry.path);
-            if (isPackageMetadata(rel_slash)) continue;
-
-            const src_abs = try std.fs.path.join(app.arena, &.{ extract_dir, entry.path });
+        for (package_files.items) |package_file| {
+            progress.setCurrent(package_file.rel_slash);
+            const src_abs = try std.fs.path.join(app.arena, &.{ extract_dir, package_file.native_rel });
+            const rel_slash = package_file.rel_slash;
             if (std.mem.endsWith(u8, rel_slash, ".hdiff")) {
                 const target_rel_slash = rel_slash[0 .. rel_slash.len - ".hdiff".len];
                 if (hdiff_names.contains(target_rel_slash)) {
                     const target_rel_native = try slashToNative(app.arena, target_rel_slash);
                     const target_abs = try std.fs.path.join(app.arena, &.{ opts.game_dir, target_rel_native });
-                    if (!pathExists(app.io, target_abs)) continue;
+                    if (!pathExists(app.io, target_abs)) {
+                        progress.completeOne();
+                        continue;
+                    }
                     if (!try runPatchTool(app, target_abs, src_abs, target_abs)) {
                         warnFmt("Failed to patch {s}", .{target_abs});
                     }
+                    progress.completeOne();
                     continue;
                 }
             }
@@ -525,12 +578,13 @@ fn applyUpdates(app: *App, opts: ApplyOptions) !bool {
             const rel_native = try slashToNative(app.arena, rel_slash);
             const dest_abs = try std.fs.path.join(app.arena, &.{ opts.game_dir, rel_native });
             try std.Io.Dir.copyFileAbsolute(src_abs, dest_abs, app.io, .{ .replace = true, .make_path = true });
+            progress.completeOne();
         }
 
         _ = opts.delete_packages;
     }
 
-    const check_ok = try doCheck(app, opts.game_dir, opts.check_mode, null);
+    const check_ok = try doCheck(app, opts.game_dir, opts.check_mode, null, &progress);
     if (!check_ok) {
         errorLog("File check failed after patching.");
         return false;
@@ -548,7 +602,7 @@ fn applyUpdates(app: *App, opts: ApplyOptions) !bool {
         if (opts.check_mode == .none) {
             warnFmt("{s} restored without re-checking.", .{basename});
         } else {
-            const restored_ok = try checkByPkgVersion(app, opts.game_dir, pkg_path, opts.check_mode, null);
+            const restored_ok = try checkByPkgVersion(app, opts.game_dir, pkg_path, opts.check_mode, null, null);
             if (!restored_ok) warnFmt("{s} may not match the current version anymore.", .{basename});
         }
     }
@@ -562,6 +616,9 @@ fn applyUpdates(app: *App, opts: ApplyOptions) !bool {
 }
 
 fn createPackages(app: *App, opts: CreateOptions) !bool {
+    var progress = FileProgress.init(app.io, "create");
+    defer progress.deinit();
+
     var version_from = opts.version_from;
     var version_to = opts.version_to;
 
@@ -578,12 +635,12 @@ fn createPackages(app: *App, opts: CreateOptions) !bool {
 
     if (!opts.skip_check) {
         info("Checking old version game files");
-        if (!try doCheck(app, opts.from_dir, .basic, null)) {
+        if (!try doCheck(app, opts.from_dir, .basic, null, &progress)) {
             errorLog("Original files not correct.");
             return false;
         }
         info("Checking new version game files");
-        if (!try doCheck(app, opts.to_dir, .basic, null)) {
+        if (!try doCheck(app, opts.to_dir, .basic, null, &progress)) {
             errorLog("Original files not correct.");
             return false;
         }
@@ -622,12 +679,12 @@ fn createPackages(app: *App, opts: CreateOptions) !bool {
 
     const main_name = try std.fmt.allocPrint(app.arena, "{s}_{s}_{s}_hdiff.zip", .{ opts.prefix, version_from.?, version_to.? });
     const main_out = try std.fs.path.join(app.arena, &.{ opts.output_dir, main_name });
-    try createDiffPackage(app, &from_files, &to_files, main_out);
+    try createDiffPackage(app, &progress, &from_files, &to_files, main_out);
 
     if (opts.reverse) {
         const reverse_name = try std.fmt.allocPrint(app.arena, "{s}_{s}_{s}_hdiff.zip", .{ opts.prefix, version_to.?, version_from.? });
         const reverse_out = try std.fs.path.join(app.arena, &.{ opts.output_dir, reverse_name });
-        try createDiffPackage(app, &to_files, &from_files, reverse_out);
+        try createDiffPackage(app, &progress, &to_files, &from_files, reverse_out);
     }
 
     return true;
@@ -635,6 +692,7 @@ fn createPackages(app: *App, opts: CreateOptions) !bool {
 
 fn createDiffPackage(
     app: *App,
+    progress: *FileProgress,
     from_files: *std.StringHashMap(FileRecord),
     to_files: *std.StringHashMap(FileRecord),
     output_zip_path: []const u8,
@@ -649,17 +707,43 @@ fn createDiffPackage(
     var hdiff_lines: std.ArrayList([]const u8) = .empty;
     defer hdiff_lines.deinit(app.arena);
 
+    var delete_count: usize = 0;
+    var copy_count: usize = 0;
+    var common_count: usize = 0;
+
     var from_it = from_files.iterator();
     while (from_it.next()) |entry| {
         if (!to_files.contains(entry.key_ptr.*)) {
-            try delete_lines.append(app.arena, entry.key_ptr.*);
+            delete_count += 1;
+        } else {
+            common_count += 1;
         }
     }
 
     var to_it = to_files.iterator();
     while (to_it.next()) |entry| {
         if (!from_files.contains(entry.key_ptr.*)) {
+            copy_count += 1;
+        }
+    }
+
+    progress.beginPhase(std.fs.path.basename(output_zip_path), delete_count + copy_count + common_count);
+
+    from_it = from_files.iterator();
+    while (from_it.next()) |entry| {
+        if (!to_files.contains(entry.key_ptr.*)) {
+            progress.setCurrent(entry.key_ptr.*);
+            try delete_lines.append(app.arena, entry.key_ptr.*);
+            progress.completeOne();
+        }
+    }
+
+    to_it = to_files.iterator();
+    while (to_it.next()) |entry| {
+        if (!from_files.contains(entry.key_ptr.*)) {
+            progress.setCurrent(entry.key_ptr.*);
             try copyIntoPackage(app, temp_dir, entry.value_ptr.*);
+            progress.completeOne();
         }
     }
 
@@ -669,10 +753,16 @@ fn createDiffPackage(
         const to_rec = to_files.getPtr(rel_slash) orelse continue;
         const from_rec = entry.value_ptr;
 
-        if (try filesEqual(app, from_rec, to_rec)) continue;
+        progress.setCurrent(rel_slash);
+
+        if (try filesEqual(app, from_rec, to_rec)) {
+            progress.completeOne();
+            continue;
+        }
 
         if (std.mem.endsWith(u8, rel_slash, "pkg_version")) {
             try copyIntoPackage(app, temp_dir, to_rec.*);
+            progress.completeOne();
             continue;
         }
 
@@ -694,6 +784,7 @@ fn createDiffPackage(
             warnFmt("Diff failed for {s}, copying full file instead.", .{rel_slash});
             try copyIntoPackage(app, temp_dir, to_rec.*);
         }
+        progress.completeOne();
     }
 
     const delete_text = try joinLines(app.arena, delete_lines.items);
@@ -780,8 +871,52 @@ fn collectAllowedFiles(
     return set;
 }
 
-fn doCheck(app: *App, dir_path: []const u8, mode: CheckMode, bad_files: ?*std.ArrayList([]const u8)) !bool {
+fn collectPackageFiles(arena: Allocator, io: Io, extract_dir: []const u8) !std.ArrayList(PackageFile) {
+    var files: std.ArrayList(PackageFile) = .empty;
+
+    var dir = try std.Io.Dir.openDirAbsolute(io, extract_dir, .{ .iterate = true });
+    defer dir.close(io);
+
+    var walker = try dir.walk(arena);
+    defer walker.deinit();
+
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+
+        const rel_slash = try normalizeRelativePath(arena, entry.path);
+        if (isPackageMetadata(rel_slash)) continue;
+
+        try files.append(arena, .{
+            .native_rel = try arena.dupe(u8, entry.path),
+            .rel_slash = rel_slash,
+        });
+    }
+
+    return files;
+}
+
+fn countPkgVersionEntries(arena: Allocator, io: Io, pkg_paths: []const []const u8) !usize {
+    var total: usize = 0;
+    for (pkg_paths) |pkg_path| {
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, pkg_path, arena, .limited(std.math.maxInt(u32)));
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |raw_line| {
+            if (trimLine(raw_line).len != 0) total += 1;
+        }
+    }
+    return total;
+}
+
+fn doCheck(
+    app: *App,
+    dir_path: []const u8,
+    mode: CheckMode,
+    bad_files: ?*std.ArrayList([]const u8),
+    progress: ?*FileProgress,
+) !bool {
     if (mode == .none) return true;
+    defer if (progress) |p| p.finishPhase();
+
     var pkg_paths = try getPkgVersionPaths(app.arena, app.io, dir_path, true);
     defer pkg_paths.deinit(app.arena);
 
@@ -790,9 +925,14 @@ fn doCheck(app: *App, dir_path: []const u8, mode: CheckMode, bad_files: ?*std.Ar
         return true;
     }
 
+    if (progress) |p| {
+        const total_entries = try countPkgVersionEntries(app.arena, app.io, pkg_paths.items);
+        p.beginPhase("Checking files", total_entries);
+    }
+
     var all_ok = true;
     for (pkg_paths.items) |pkg_path| {
-        const ok = try checkByPkgVersion(app, dir_path, pkg_path, mode, bad_files);
+        const ok = try checkByPkgVersion(app, dir_path, pkg_path, mode, bad_files, progress);
         all_ok = all_ok and ok;
     }
     return all_ok;
@@ -804,6 +944,7 @@ fn checkByPkgVersion(
     pkg_path: []const u8,
     mode: CheckMode,
     bad_files: ?*std.ArrayList([]const u8),
+    progress: ?*FileProgress,
 ) !bool {
     if (mode == .none) return true;
 
@@ -817,6 +958,10 @@ fn checkByPkgVersion(
 
         const parsed = try std.json.parseFromSlice(PkgVersionEntry, app.arena, line, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
+        if (progress) |p| {
+            p.setCurrent(parsed.value.remoteName);
+            defer p.completeOne();
+        }
 
         const rel_native = try slashToNative(app.arena, parsed.value.remoteName);
         const check_path = try std.fs.path.join(app.arena, &.{ dir_path, rel_native });
@@ -1150,9 +1295,34 @@ fn isPackageMetadata(rel_slash: []const u8) bool {
 const ZipCentralEntry = struct {
     name: []const u8,
     crc32: u32,
-    compressed_size: u32,
-    uncompressed_size: u32,
-    local_offset: u32,
+    compressed_size: u64,
+    uncompressed_size: u64,
+    local_offset: u64,
+
+    fn needsZip64(self: ZipCentralEntry) bool {
+        _ = self;
+        return true;
+    }
+
+    fn localExtraDataLen(self: ZipCentralEntry) u16 {
+        _ = self;
+        return 16;
+    }
+
+    fn localExtraLen(self: ZipCentralEntry) u16 {
+        _ = self;
+        return 20;
+    }
+
+    fn centralExtraDataLen(self: ZipCentralEntry) u16 {
+        _ = self;
+        return 24;
+    }
+
+    fn centralExtraLen(self: ZipCentralEntry) u16 {
+        _ = self;
+        return 28;
+    }
 };
 
 fn writeStoreArchive(
@@ -1184,42 +1354,47 @@ fn writeStoreArchive(
         const file_abs_path = try std.fs.path.join(arena, &.{ source_dir_path, entry.path });
 
         const stat = try std.Io.Dir.cwd().statFile(io, file_abs_path, .{});
-        if (stat.size > std.math.maxInt(u32)) return error.FileTooBigForSimpleZip;
-        if (zip_offset > std.math.maxInt(u32)) return error.FileTooBigForSimpleZip;
-
         const file_crc = try crc32OfFile(io, file_abs_path);
-        const file_size_u32: u32 = @intCast(stat.size);
-        const local_offset_u32: u32 = @intCast(zip_offset);
+        const entry_info: ZipCentralEntry = .{
+            .name = rel_name,
+            .crc32 = file_crc,
+            .compressed_size = stat.size,
+            .uncompressed_size = stat.size,
+            .local_offset = zip_offset,
+        };
 
-        try writeZipLocalHeader(&writer.interface, @intCast(rel_name.len), file_crc, file_size_u32);
+        try writeZipLocalHeader(&writer.interface, entry_info);
         try writer.interface.writeAll(rel_name);
-        zip_offset += @sizeOf(std.zip.LocalFileHeader) + rel_name.len;
+        try writeZipLocalExtra(&writer.interface, entry_info);
+        zip_offset += @sizeOf(std.zip.LocalFileHeader) + rel_name.len + entry_info.localExtraLen();
 
         try streamFile(io, file_abs_path, &writer.interface);
         zip_offset += stat.size;
 
-        try entries.append(arena, .{
-            .name = rel_name,
-            .crc32 = file_crc,
-            .compressed_size = file_size_u32,
-            .uncompressed_size = file_size_u32,
-            .local_offset = local_offset_u32,
-        });
+        try entries.append(arena, entry_info);
     }
 
     const central_dir_offset = zip_offset;
     for (entries.items) |entry| {
         try writeZipCentralHeader(&writer.interface, entry);
         try writer.interface.writeAll(entry.name);
-        zip_offset += @sizeOf(std.zip.CentralDirectoryFileHeader) + entry.name.len;
+        try writeZipCentralExtra(&writer.interface, entry);
+        zip_offset += @sizeOf(std.zip.CentralDirectoryFileHeader) + entry.name.len + entry.centralExtraLen();
     }
 
     const central_dir_size = zip_offset - central_dir_offset;
-    if (entries.items.len > std.math.maxInt(u16)) return error.TooManyZipEntries;
-    if (central_dir_offset > std.math.maxInt(u32)) return error.FileTooBigForSimpleZip;
-    if (central_dir_size > std.math.maxInt(u32)) return error.FileTooBigForSimpleZip;
+    const zip64_end_offset = zip_offset;
+    try writeZipEndRecord64(&writer.interface, entries.items.len, central_dir_size, central_dir_offset);
+    zip_offset += @sizeOf(std.zip.EndRecord64);
+    try writeZipEndLocator64(&writer.interface, zip64_end_offset);
+    zip_offset += @sizeOf(std.zip.EndLocator64);
 
-    try writeZipEndRecord(&writer.interface, @intCast(entries.items.len), @intCast(central_dir_size), @intCast(central_dir_offset));
+    try writeZipEndRecord(
+        &writer.interface,
+        zipCountLegacy(entries.items.len),
+        zipU32Legacy(central_dir_size),
+        zipU32Legacy(central_dir_offset),
+    );
     try writer.interface.flush();
 }
 
@@ -1258,38 +1433,59 @@ fn streamFile(io: Io, path: []const u8, writer: *Io.Writer) !void {
     _ = try reader.interface.streamRemaining(writer);
 }
 
-fn writeZipLocalHeader(writer: *Io.Writer, name_len: u16, crc32: u32, size: u32) !void {
+fn writeZipLocalHeader(writer: *Io.Writer, entry: ZipCentralEntry) !void {
     try writer.writeAll(&std.zip.local_file_header_sig);
-    try writer.writeInt(u16, 20, .little);
-    try writer.writeInt(u16, 0, .little);
-    try writer.writeInt(u16, @intFromEnum(std.zip.CompressionMethod.store), .little);
-    try writer.writeInt(u16, 0, .little);
-    try writer.writeInt(u16, 0, .little);
-    try writer.writeInt(u32, crc32, .little);
-    try writer.writeInt(u32, size, .little);
-    try writer.writeInt(u32, size, .little);
-    try writer.writeInt(u16, name_len, .little);
-    try writer.writeInt(u16, 0, .little);
-}
-
-fn writeZipCentralHeader(writer: *Io.Writer, entry: ZipCentralEntry) !void {
-    try writer.writeAll(&std.zip.central_file_header_sig);
-    try writer.writeInt(u16, 20, .little);
-    try writer.writeInt(u16, 20, .little);
+    try writer.writeInt(u16, if (entry.needsZip64()) 45 else 20, .little);
     try writer.writeInt(u16, 0, .little);
     try writer.writeInt(u16, @intFromEnum(std.zip.CompressionMethod.store), .little);
     try writer.writeInt(u16, 0, .little);
     try writer.writeInt(u16, 0, .little);
     try writer.writeInt(u32, entry.crc32, .little);
-    try writer.writeInt(u32, entry.compressed_size, .little);
-    try writer.writeInt(u32, entry.uncompressed_size, .little);
+    try writer.writeInt(u32, zipU32Legacy(entry.compressed_size), .little);
+    try writer.writeInt(u32, zipU32Legacy(entry.uncompressed_size), .little);
     try writer.writeInt(u16, @intCast(entry.name.len), .little);
+    try writer.writeInt(u16, entry.localExtraLen(), .little);
+}
+
+fn writeZipCentralHeader(writer: *Io.Writer, entry: ZipCentralEntry) !void {
+    try writer.writeAll(&std.zip.central_file_header_sig);
+    try writer.writeInt(u16, if (entry.needsZip64()) 45 else 20, .little);
+    try writer.writeInt(u16, if (entry.needsZip64()) 45 else 20, .little);
     try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u16, @intFromEnum(std.zip.CompressionMethod.store), .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u16, 0, .little);
+    try writer.writeInt(u32, entry.crc32, .little);
+    try writer.writeInt(u32, zipU32Legacy(entry.compressed_size), .little);
+    try writer.writeInt(u32, zipU32Legacy(entry.uncompressed_size), .little);
+    try writer.writeInt(u16, @intCast(entry.name.len), .little);
+    try writer.writeInt(u16, entry.centralExtraLen(), .little);
     try writer.writeInt(u16, 0, .little);
     try writer.writeInt(u16, 0, .little);
     try writer.writeInt(u16, 0, .little);
     try writer.writeInt(u32, 0, .little);
-    try writer.writeInt(u32, entry.local_offset, .little);
+    try writer.writeInt(u32, zipU32Legacy(entry.local_offset), .little);
+}
+
+fn writeZipLocalExtra(writer: *Io.Writer, entry: ZipCentralEntry) !void {
+    const data_len = entry.localExtraDataLen();
+    if (data_len == 0) return;
+
+    try writer.writeInt(u16, @intFromEnum(std.zip.ExtraHeader.zip64_info), .little);
+    try writer.writeInt(u16, data_len, .little);
+    try writer.writeInt(u64, entry.uncompressed_size, .little);
+    try writer.writeInt(u64, entry.compressed_size, .little);
+}
+
+fn writeZipCentralExtra(writer: *Io.Writer, entry: ZipCentralEntry) !void {
+    const data_len = entry.centralExtraDataLen();
+    if (data_len == 0) return;
+
+    try writer.writeInt(u16, @intFromEnum(std.zip.ExtraHeader.zip64_info), .little);
+    try writer.writeInt(u16, data_len, .little);
+    try writer.writeInt(u64, entry.uncompressed_size, .little);
+    try writer.writeInt(u64, entry.compressed_size, .little);
+    try writer.writeInt(u64, entry.local_offset, .little);
 }
 
 fn writeZipEndRecord(writer: *Io.Writer, count: u16, central_dir_size: u32, central_dir_offset: u32) !void {
@@ -1301,4 +1497,34 @@ fn writeZipEndRecord(writer: *Io.Writer, count: u16, central_dir_size: u32, cent
     try writer.writeInt(u32, central_dir_size, .little);
     try writer.writeInt(u32, central_dir_offset, .little);
     try writer.writeInt(u16, 0, .little);
+}
+
+fn writeZipEndRecord64(writer: *Io.Writer, count: usize, central_dir_size: u64, central_dir_offset: u64) !void {
+    try writer.writeAll(&std.zip.end_record64_sig);
+    try writer.writeInt(u64, @sizeOf(std.zip.EndRecord64) - 12, .little);
+    try writer.writeInt(u16, 45, .little);
+    try writer.writeInt(u16, 45, .little);
+    try writer.writeInt(u32, 0, .little);
+    try writer.writeInt(u32, 0, .little);
+    try writer.writeInt(u64, count, .little);
+    try writer.writeInt(u64, count, .little);
+    try writer.writeInt(u64, central_dir_size, .little);
+    try writer.writeInt(u64, central_dir_offset, .little);
+}
+
+fn writeZipEndLocator64(writer: *Io.Writer, zip64_end_offset: u64) !void {
+    try writer.writeAll(&std.zip.end_locator64_sig);
+    try writer.writeInt(u32, 0, .little);
+    try writer.writeInt(u64, zip64_end_offset, .little);
+    try writer.writeInt(u32, 1, .little);
+}
+
+fn zipCountLegacy(count: usize) u16 {
+    _ = count;
+    return std.math.maxInt(u16);
+}
+
+fn zipU32Legacy(value: u64) u32 {
+    _ = value;
+    return std.math.maxInt(u32);
 }
