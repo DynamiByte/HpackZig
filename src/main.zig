@@ -1,5 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const sevenzip = @import("7z.zig");
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -16,10 +17,8 @@ const readme_text =
 
 const embedded_hdiff = @embedFile("hdiffz_bin");
 const embedded_hpatch = @embedFile("hpatchz_bin");
-const embedded_archive_tool = @embedFile("archive_tool_bin");
 const hdiff_name = if (builtin.os.tag == .windows) "hdiffz.exe" else "hdiffz";
 const hpatch_name = if (builtin.os.tag == .windows) "hpatchz.exe" else "hpatchz";
-const archive_tool_name = if (builtin.os.tag == .windows) "7za.exe" else "7zz";
 
 const certain_games = [_][]const u8{
     "genshinimpact",
@@ -80,7 +79,7 @@ const CreateOptions = struct {
     auto_version: bool = false,
     output_dir: []const u8 = ".",
     prefix: []const u8 = "game",
-    archive_type: []const u8 = "zip",
+    archive_type: []const u8 = "7z",
     reverse: bool = false,
     skip_check: bool = false,
     only_package: bool = false,
@@ -89,17 +88,27 @@ const CreateOptions = struct {
     executable_skip: bool = false,
 };
 
+fn termPrint(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print(fmt, args);
+}
+
+fn printBanner() void {
+    termPrint("{s}", .{startup_banner_ansi});
+}
+
 const FileProgress = struct {
     io: Io,
     root_name: []const u8,
     root: std.Progress.Node = std.Progress.Node.none,
     phase: std.Progress.Node = std.Progress.Node.none,
+    current: std.Progress.Node = std.Progress.Node.none,
     phase_name: []const u8 = "",
     total_items: usize = 0,
     completed_items: usize = 0,
     current_name: []const u8 = "",
     use_fallback: bool = false,
     root_started: bool = false,
+    fallback_root_rendered: bool = false,
 
     fn init(io: Io, root_name: []const u8) FileProgress {
         return .{
@@ -113,36 +122,46 @@ const FileProgress = struct {
         if (self.root.index != .none) self.root.end();
     }
 
-    fn beginStage(self: *FileProgress, name: []const u8) void {
+    pub fn beginStage(self: *FileProgress, name: []const u8) void {
         self.beginPhaseInternal(name, 0);
     }
 
-    fn beginPhase(self: *FileProgress, name: []const u8, total_items: usize) void {
+    pub fn beginPhase(self: *FileProgress, name: []const u8, total_items: usize) void {
         self.beginPhaseInternal(name, total_items);
     }
 
-    fn setCurrent(self: *FileProgress, name: []const u8) void {
+    pub fn setCurrent(self: *FileProgress, name: []const u8) void {
         self.current_name = name;
-        if (self.phase.index != .none) self.phase.setName(name);
+        if (self.phase.index != .none) {
+            if (self.current.index == .none) {
+                self.current = self.phase.start(name, 0);
+            } else {
+                self.current.setName(name);
+            }
+        }
         self.renderFallbackCurrent();
     }
 
-    fn completeOne(self: *FileProgress) void {
+    pub fn completeOne(self: *FileProgress) void {
+        self.finishCurrent();
         if (self.completed_items < self.total_items) self.completed_items += 1;
         self.current_name = "";
-        if (self.phase.index != .none) self.phase.completeOne();
+        if (self.phase.index != .none) self.phase.setCompletedItems(self.completed_items);
     }
 
-    fn finishPhase(self: *FileProgress) void {
+    pub fn hasCurrent(self: *const FileProgress) bool {
+        return self.current.index != .none or self.current_name.len != 0;
+    }
+
+    pub fn finishPhase(self: *FileProgress) void {
+        self.finishCurrent();
         if (self.use_fallback and self.phase_name.len != 0) {
             if (self.total_items == 0) {
-                std.debug.print("[progress] {s} {s} done\n", .{
-                    self.root_name,
+                termPrint("[progress]   {s} done\n", .{
                     self.phase_name,
                 });
             } else {
-                std.debug.print("[progress] {s} {s} {d}/{d}\n", .{
-                    self.root_name,
+                termPrint("[progress]   {s} {d}/{d}\n", .{
                     self.phase_name,
                     self.total_items,
                     self.total_items,
@@ -158,6 +177,13 @@ const FileProgress = struct {
         self.total_items = 0;
         self.completed_items = 0;
         self.current_name = "";
+    }
+
+    fn finishCurrent(self: *FileProgress) void {
+        if (self.current.index == .none) return;
+        self.current.end();
+        self.current = std.Progress.Node.none;
+        if (self.phase.index != .none) self.phase.setCompletedItems(self.completed_items);
     }
 
     fn beginPhaseInternal(self: *FileProgress, name: []const u8, total_items: usize) void {
@@ -178,18 +204,24 @@ const FileProgress = struct {
         self.root_started = true;
         self.root = std.Progress.start(self.io, .{ .root_name = self.root_name });
         self.use_fallback = self.root.index == .none;
+        self.renderFallbackRoot();
     }
 
-    fn renderFallbackPhaseStart(self: *const FileProgress) void {
+    fn renderFallbackRoot(self: *FileProgress) void {
+        if (!self.use_fallback) return;
+        if (self.fallback_root_rendered) return;
+        termPrint("[progress] {s}\n", .{self.root_name});
+        self.fallback_root_rendered = true;
+    }
+
+    fn renderFallbackPhaseStart(self: *FileProgress) void {
         if (!self.use_fallback) return;
         if (self.total_items == 0) {
-            std.debug.print("[progress] {s} {s}\n", .{
-                self.root_name,
+            termPrint("[progress]   {s}\n", .{
                 self.phase_name,
             });
         } else {
-            std.debug.print("[progress] {s} {s} 0/{d}\n", .{
-                self.root_name,
+            termPrint("[progress]   {s} 0/{d}\n", .{
                 self.phase_name,
                 self.total_items,
             });
@@ -199,14 +231,12 @@ const FileProgress = struct {
     fn renderFallbackCurrent(self: *const FileProgress) void {
         if (!self.use_fallback) return;
         if (self.total_items == 0) {
-            std.debug.print("[progress] {s} {s}: {s}\n", .{
-                self.root_name,
+            termPrint("[progress]   {s}: {s}\n", .{
                 self.phase_name,
                 self.current_name,
             });
         } else {
-            std.debug.print("[progress] {s} {s} {d}/{d} {s}\n", .{
-                self.root_name,
+            termPrint("[progress]   {s} {d}/{d} {s}\n", .{
                 self.phase_name,
                 self.completed_items + 1,
                 self.total_items,
@@ -248,7 +278,7 @@ const App = struct {
 
         const hdiff_base = try std.fmt.allocPrint(self.arena, "hpackzig_{d}_{s}", .{ self.temp_counter, hdiff_name });
         const hpatch_base = try std.fmt.allocPrint(self.arena, "hpackzig_{d}_{s}", .{ self.temp_counter, hpatch_name });
-        const archive_tool_base = try std.fmt.allocPrint(self.arena, "hpackzig_{d}_{s}", .{ self.temp_counter, archive_tool_name });
+        const archive_tool_base = try std.fmt.allocPrint(self.arena, "hpackzig_{d}_{s}", .{ self.temp_counter, sevenzip.archive_tool_name });
 
         const hdiff_path = try std.fs.path.join(self.arena, &.{ temp_root, hdiff_base });
         const hpatch_path = try std.fs.path.join(self.arena, &.{ temp_root, hpatch_base });
@@ -256,7 +286,7 @@ const App = struct {
 
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = hdiff_path, .data = embedded_hdiff });
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = hpatch_path, .data = embedded_hpatch });
-        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = archive_tool_path, .data = embedded_archive_tool });
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = archive_tool_path, .data = sevenzip.embedded_archive_tool });
         try makeExecutableIfNeeded(self.io, hdiff_path);
         try makeExecutableIfNeeded(self.io, hpatch_path);
         try makeExecutableIfNeeded(self.io, archive_tool_path);
@@ -270,7 +300,7 @@ const App = struct {
         self.archive_tool_path = archive_tool_path;
     }
 
-    fn makeTempDir(self: *App, parent: []const u8, label: []const u8) ![]const u8 {
+    pub fn makeTempDir(self: *App, parent: []const u8, label: []const u8) ![]const u8 {
         self.temp_counter += 1;
         const name = try std.fmt.allocPrint(self.arena, "hpackzig_{s}_{d}", .{ label, self.temp_counter });
         const path = try std.fs.path.join(self.arena, &.{ parent, name });
@@ -286,8 +316,16 @@ const App = struct {
             if (builtin.os.tag == .windows) "." else "/tmp";
     }
 
-    fn makeSystemTempDir(self: *App, label: []const u8) ![]const u8 {
+    pub fn makeSystemTempDir(self: *App, label: []const u8) ![]const u8 {
         return self.makeTempDir(self.tempRoot(), label);
+    }
+
+    pub fn forgetTempPath(self: *App, path: []const u8) void {
+        for (self.temp_paths.items, 0..) |temp_path, i| {
+            if (!std.mem.eql(u8, temp_path, path)) continue;
+            _ = self.temp_paths.swapRemove(i);
+            return;
+        }
     }
 };
 
@@ -302,22 +340,28 @@ pub fn main(init: std.process.Init) !u8 {
 
     const args = try init.minimal.args.toSlice(app.arena);
     const exit_code = run(&app, args) catch |e| blk: {
-        std.debug.print("Error: {s}\n", .{@errorName(e)});
+        termPrint("Error: {s}\n", .{@errorName(e)});
         break :blk 1;
     };
     return exit_code;
 }
 
 fn run(app: *App, args: []const [:0]const u8) !u8 {
-    printBanner();
-
     if (args.len <= 1) {
+        printBanner();
         printUsage();
         return 0;
     }
 
     const command = args[1];
+    if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
+        printBanner();
+        printUsage();
+        return 0;
+    }
+
     if (std.mem.eql(u8, command, "apply")) {
+        printBanner();
         var opts = try parseApplyOptions(app.arena, args[2..]);
         opts.game_dir = try makeAbsolute(app.arena, app.io, opts.game_dir);
         for (opts.archive_paths) |*archive_path| archive_path.* = try makeAbsolute(app.arena, app.io, archive_path.*);
@@ -325,6 +369,7 @@ fn run(app: *App, args: []const [:0]const u8) !u8 {
         return if (try applyUpdates(app, opts)) 0 else 1;
     }
     if (std.mem.eql(u8, command, "check")) {
+        printBanner();
         var opts = try parseCheckOptions(args[2..]);
         opts.game_dir = try makeAbsolute(app.arena, app.io, opts.game_dir);
         if (opts.output_dir) |output_dir| opts.output_dir = try makeAbsolute(app.arena, app.io, output_dir);
@@ -332,6 +377,7 @@ fn run(app: *App, args: []const [:0]const u8) !u8 {
         return if (try runCheckCommand(app, opts)) 0 else 1;
     }
     if (std.mem.eql(u8, command, "create")) {
+        printBanner();
         var opts = try parseCreateOptions(args[2..]);
         opts.from_dir = try makeAbsolute(app.arena, app.io, opts.from_dir);
         opts.to_dir = try makeAbsolute(app.arena, app.io, opts.to_dir);
@@ -353,15 +399,16 @@ fn run(app: *App, args: []const [:0]const u8) !u8 {
                 errorLog("Error extracting archive input for create.");
                 return 1;
             },
+            error.UnsupportedArchiveType => {
+                errorFmt("Unsupported archive type. Use {s}.", .{sevenzip.package_archive_type_usage});
+                return 1;
+            },
             else => return e,
         };
         return if (created) 0 else 1;
     }
-    if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
-        printUsage();
-        return 0;
-    }
 
+    printBanner();
     printUsage();
     return 1;
 }
@@ -535,7 +582,7 @@ fn parseCreateShortFlagGroup(arg: []const u8, opts: *CreateOptions) !bool {
 }
 
 fn runCheckCommand(app: *App, opts: CheckOptions) !bool {
-    var progress = FileProgress.init(app.io, "check");
+    var progress = FileProgress.init(app.io, "Checking files");
     defer progress.deinit();
 
     var bad_files: std.ArrayList([]const u8) = .empty;
@@ -579,7 +626,7 @@ fn parseCheckMode(text: []const u8) !CheckMode {
 }
 
 fn printUsage() void {
-    std.debug.print(
+    termPrint(
         \\HPack Zig
         \\
         \\Commands:
@@ -591,7 +638,7 @@ fn printUsage() void {
         \\  --output, -o <dir>
         \\  --prefix, -p <name>
         \\  --archive-type, --archivetype <type>
-        \\    [zip (default) | 7z | tar | gzip | bzip2 | xz]
+        \\    {s}
         \\  --reverse, -r
         \\  --skipCheck, -s
         \\  --only-include-pkg-defined-files, -d
@@ -599,35 +646,35 @@ fn printUsage() void {
         \\  --force
         \\  --executable-skip, -e
         \\
-    , .{});
-}
-
-fn printBanner() void {
-    std.debug.print("{s}", .{startup_banner_ansi});
+    , .{sevenzip.package_archive_type_usage});
 }
 
 fn info(message: []const u8) void {
-    std.debug.print("[info] {s}\n", .{message});
+    termPrint("[info] {s}\n", .{message});
 }
 
 fn warn(message: []const u8) void {
-    std.debug.print("[warn] {s}\n", .{message});
+    termPrint("[warn] {s}\n", .{message});
 }
 
 fn errorLog(message: []const u8) void {
-    std.debug.print("[error] {s}\n", .{message});
+    termPrint("[error] {s}\n", .{message});
 }
 
 fn infoFmt(comptime fmt: []const u8, args: anytype) void {
-    std.debug.print("[info] " ++ fmt ++ "\n", args);
+    termPrint("[info] " ++ fmt ++ "\n", args);
 }
 
 fn warnFmt(comptime fmt: []const u8, args: anytype) void {
-    std.debug.print("[warn] " ++ fmt ++ "\n", args);
+    termPrint("[warn] " ++ fmt ++ "\n", args);
+}
+
+fn errorFmt(comptime fmt: []const u8, args: anytype) void {
+    termPrint("[error] " ++ fmt ++ "\n", args);
 }
 
 fn applyUpdates(app: *App, opts: ApplyOptions) !bool {
-    var progress = FileProgress.init(app.io, "apply");
+    var progress = FileProgress.init(app.io, "Applying patch");
     defer progress.deinit();
 
     progress.beginStage("Preparing tools");
@@ -648,13 +695,10 @@ fn applyUpdates(app: *App, opts: ApplyOptions) !bool {
 
     for (opts.archive_paths) |archive_path| {
         infoFmt("Applying {s}", .{archive_path});
-        const extract_dir = try app.makeTempDir(opts.game_dir, "extract");
-        const extract_phase = try std.fmt.allocPrint(app.arena, "Extracting {s}", .{std.fs.path.basename(archive_path)});
-        progress.beginStage(extract_phase);
-        if (!try extractArchive(app, archive_path, extract_dir)) {
+        const extract_dir = try sevenzip.prepareApplyInput(app, &progress, archive_path, opts.game_dir) orelse {
             warnFmt("The file {s} is not a supported archive or failed to extract.", .{archive_path});
             continue;
-        }
+        };
 
         var hdiff_names = try readRemoteNameSet(app.arena, app.io, extract_dir, "hdifffiles.txt");
         defer hdiff_names.deinit();
@@ -739,7 +783,7 @@ fn applyUpdates(app: *App, opts: ApplyOptions) !bool {
 }
 
 fn createPackages(app: *App, opts: CreateOptions) !bool {
-    var progress = FileProgress.init(app.io, "create");
+    var progress = FileProgress.init(app.io, "Creating patch");
     defer progress.deinit();
 
     const from_input_is_dir = isDirectory(app.io, opts.from_dir);
@@ -749,8 +793,8 @@ fn createPackages(app: *App, opts: CreateOptions) !bool {
         try app.ensureTools();
     }
 
-    const from_root = try resolveCreateInputDir(app, &progress, opts.from_dir, "old", opts.executable_skip);
-    const to_root = try resolveCreateInputDir(app, &progress, opts.to_dir, "new", opts.executable_skip);
+    const from_root = try sevenzip.resolveCreateInputDir(app, &progress, opts.from_dir, "old", opts.executable_skip, validateGameDir);
+    const to_root = try sevenzip.resolveCreateInputDir(app, &progress, opts.to_dir, "new", opts.executable_skip, validateGameDir);
 
     var version_from = opts.version_from;
     var version_to = opts.version_to;
@@ -766,6 +810,7 @@ fn createPackages(app: *App, opts: CreateOptions) !bool {
     if (!isValidVersionString(version_from.?) or !isValidVersionString(version_to.?)) {
         return error.InvalidVersionString;
     }
+    const archive_spec = try sevenzip.normalizePackageArchiveType(opts.archive_type);
 
     if (!opts.skip_check) {
         info("Checking old version game files");
@@ -799,11 +844,23 @@ fn createPackages(app: *App, opts: CreateOptions) !bool {
         allowed_to = try collectAllowedFiles(app.arena, app.io, to_root, opts.include_audios);
     }
 
-    progress.beginStage("Enumerating old files");
-    var from_files = try enumerateFiles(app.arena, app.io, from_root, if (allowed_from) |*m| m else null);
+    var from_files = try enumerateFiles(
+        app.arena,
+        app.io,
+        &progress,
+        "Enumerating old files",
+        from_root,
+        if (allowed_from) |*m| m else null,
+    );
     defer from_files.deinit();
-    progress.beginStage("Enumerating new files");
-    var to_files = try enumerateFiles(app.arena, app.io, to_root, if (allowed_to) |*m| m else null);
+    var to_files = try enumerateFiles(
+        app.arena,
+        app.io,
+        &progress,
+        "Enumerating new files",
+        to_root,
+        if (allowed_to) |*m| m else null,
+    );
     defer to_files.deinit();
 
     progress.beginStage("Comparing file lists");
@@ -817,24 +874,14 @@ fn createPackages(app: *App, opts: CreateOptions) !bool {
     progress.beginStage("Preparing output");
     try std.Io.Dir.cwd().createDirPath(app.io, opts.output_dir);
 
-    const main_name = try std.fmt.allocPrint(app.arena, "{s}_{s}_{s}_hdiff.{s}", .{
-        opts.prefix,
-        version_from.?,
-        version_to.?,
-        opts.archive_type,
-    });
+    const main_name = try sevenzip.makePackageOutputName(app.arena, opts.prefix, version_from.?, version_to.?, archive_spec);
     const main_out = try std.fs.path.join(app.arena, &.{ opts.output_dir, main_name });
-    try createDiffPackage(app, &progress, &from_files, &to_files, main_out, opts.archive_type);
+    try createDiffPackage(app, &progress, &from_files, &to_files, main_out, archive_spec);
 
     if (opts.reverse) {
-        const reverse_name = try std.fmt.allocPrint(app.arena, "{s}_{s}_{s}_hdiff.{s}", .{
-            opts.prefix,
-            version_to.?,
-            version_from.?,
-            opts.archive_type,
-        });
+        const reverse_name = try sevenzip.makePackageOutputName(app.arena, opts.prefix, version_to.?, version_from.?, archive_spec);
         const reverse_out = try std.fs.path.join(app.arena, &.{ opts.output_dir, reverse_name });
-        try createDiffPackage(app, &progress, &to_files, &from_files, reverse_out, opts.archive_type);
+        try createDiffPackage(app, &progress, &to_files, &from_files, reverse_out, archive_spec);
     }
 
     return true;
@@ -846,7 +893,7 @@ fn createDiffPackage(
     from_files: *std.StringHashMap(FileRecord),
     to_files: *std.StringHashMap(FileRecord),
     output_archive_path: []const u8,
-    archive_type: []const u8,
+    archive_spec: sevenzip.PackageArchiveSpec,
 ) !void {
     infoFmt("Creating {s}", .{output_archive_path});
     const output_parent = std.fs.path.dirname(output_archive_path) orelse ".";
@@ -945,7 +992,7 @@ fn createDiffPackage(
     try std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = try std.fs.path.join(app.arena, &.{ temp_dir, "hdifffiles.txt" }), .data = hdiff_text });
     try std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = try std.fs.path.join(app.arena, &.{ temp_dir, "README.txt" }), .data = readme_text });
 
-    try writePackageArchive(app, temp_dir, output_archive_path, archive_type);
+    try sevenzip.writePackageOutput(app, progress, temp_dir, output_archive_path, archive_spec);
 }
 
 fn copyIntoPackage(app: *App, package_dir: []const u8, record: FileRecord) !void {
@@ -957,10 +1004,15 @@ fn copyIntoPackage(app: *App, package_dir: []const u8, record: FileRecord) !void
 fn enumerateFiles(
     arena: Allocator,
     io: Io,
+    progress: *FileProgress,
+    phase_name: []const u8,
     root_dir_path: []const u8,
     allowed: ?*std.StringHashMap(u8),
 ) !std.StringHashMap(FileRecord) {
     var map = std.StringHashMap(FileRecord).init(arena);
+
+    const total_files = try countFilesInTree(io, root_dir_path);
+    progress.beginPhase(phase_name, total_files);
 
     var root_dir = try std.Io.Dir.openDirAbsolute(io, root_dir_path, .{ .iterate = true });
     defer root_dir.close(io);
@@ -972,8 +1024,12 @@ fn enumerateFiles(
         if (entry.kind != .file) continue;
 
         const rel_slash = try normalizeRelativePath(arena, entry.path);
+        progress.setCurrent(rel_slash);
         if (allowed) |allow_map| {
-            if (!allow_map.contains(rel_slash)) continue;
+            if (!allow_map.contains(rel_slash)) {
+                progress.completeOne();
+                continue;
+            }
         }
 
         const abs_path = try std.fs.path.join(arena, &.{ root_dir_path, entry.path });
@@ -984,9 +1040,26 @@ fn enumerateFiles(
             .abs_path = abs_path,
             .size = stat.size,
         });
+        progress.completeOne();
     }
 
     return map;
+}
+
+fn countFilesInTree(io: Io, root_dir_path: []const u8) !usize {
+    var total: usize = 0;
+
+    var root_dir = try std.Io.Dir.openDirAbsolute(io, root_dir_path, .{ .iterate = true });
+    defer root_dir.close(io);
+
+    var walker = try root_dir.walk(std.heap.page_allocator);
+    defer walker.deinit();
+
+    while (try walker.next(io)) |entry| {
+        if (entry.kind == .file) total += 1;
+    }
+
+    return total;
 }
 
 fn collectAllowedFiles(
@@ -1268,77 +1341,6 @@ fn runPatchTool(app: *App, from_path: []const u8, diff_path: []const u8, to_path
     };
 }
 
-fn extractArchive(app: *App, archive_path: []const u8, dest_dir: []const u8) !bool {
-    const output_arg = try std.fmt.allocPrint(app.arena, "-o{s}", .{dest_dir});
-    const argv = [_][]const u8{
-        app.archive_tool_path.?,
-        "x",
-        "-y",
-        "-aoa",
-        output_arg,
-        archive_path,
-    };
-    const result = std.process.run(app.gpa, app.io, .{ .argv = &argv }) catch return false;
-    defer app.gpa.free(result.stdout);
-    defer app.gpa.free(result.stderr);
-    return switch (result.term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
-}
-
-fn resolveCreateInputDir(
-    app: *App,
-    progress: *FileProgress,
-    input_path: []const u8,
-    comptime label: []const u8,
-    executable_skip: bool,
-) ![]const u8 {
-    if (isDirectory(app.io, input_path)) {
-        try validateGameDir(app.io, input_path, executable_skip);
-        return input_path;
-    }
-
-    if (!pathExists(app.io, input_path)) return error.FileNotFound;
-
-    const phase_name = try std.fmt.allocPrint(app.arena, "Extracting {s} archive {s}", .{
-        label,
-        std.fs.path.basename(input_path),
-    });
-    progress.beginStage(phase_name);
-
-    const extract_dir = try app.makeSystemTempDir(label ++ "_archive");
-    if (!try extractArchive(app, input_path, extract_dir)) return error.ArchiveExtractFailed;
-
-    const root_dir = try unwrapSingleRootDir(app.arena, app.io, extract_dir);
-    try validateGameDir(app.io, root_dir, executable_skip);
-    return root_dir;
-}
-
-fn unwrapSingleRootDir(arena: Allocator, io: Io, dir_path: []const u8) ![]const u8 {
-    var current = dir_path;
-
-    while (true) {
-        var dir = try std.Io.Dir.openDirAbsolute(io, current, .{ .iterate = true });
-        defer dir.close(io);
-
-        var iter = dir.iterate();
-        var only_dir_name: ?[]const u8 = null;
-        var entry_count: usize = 0;
-
-        while (try iter.next(io)) |entry| {
-            if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
-            entry_count += 1;
-            if (entry_count > 1) return current;
-            if (entry.kind != .directory) return current;
-            only_dir_name = try arena.dupe(u8, entry.name);
-        }
-
-        const dir_name = only_dir_name orelse return current;
-        current = try std.fs.path.join(arena, &.{ current, dir_name });
-    }
-}
-
 fn getPkgVersionPaths(arena: Allocator, io: Io, dir_path: []const u8, include_audios: bool) !std.ArrayList([]const u8) {
     var list: std.ArrayList([]const u8) = .empty;
 
@@ -1508,286 +1510,4 @@ fn isPackageMetadata(rel_slash: []const u8) bool {
     return std.mem.eql(u8, rel_slash, "deletefiles.txt") or
         std.mem.eql(u8, rel_slash, "hdifffiles.txt") or
         std.mem.eql(u8, rel_slash, "README.txt");
-}
-
-const ZipCentralEntry = struct {
-    name: []const u8,
-    crc32: u32,
-    compressed_size: u64,
-    uncompressed_size: u64,
-    local_offset: u64,
-
-    fn needsZip64(self: ZipCentralEntry) bool {
-        _ = self;
-        return true;
-    }
-
-    fn localExtraDataLen(self: ZipCentralEntry) u16 {
-        _ = self;
-        return 16;
-    }
-
-    fn localExtraLen(self: ZipCentralEntry) u16 {
-        _ = self;
-        return 20;
-    }
-
-    fn centralExtraDataLen(self: ZipCentralEntry) u16 {
-        _ = self;
-        return 24;
-    }
-
-    fn centralExtraLen(self: ZipCentralEntry) u16 {
-        _ = self;
-        return 28;
-    }
-};
-
-fn writeStoreArchive(
-    arena: Allocator,
-    io: Io,
-    source_dir_path: []const u8,
-    output_zip_path: []const u8,
-) !void {
-    var source_dir = try std.Io.Dir.openDirAbsolute(io, source_dir_path, .{ .iterate = true });
-    defer source_dir.close(io);
-
-    var out_file = try std.Io.Dir.createFileAbsolute(io, output_zip_path, .{});
-    defer out_file.close(io);
-
-    var writer_buffer: [16 * 1024]u8 = undefined;
-    var writer = out_file.writer(io, &writer_buffer);
-
-    var entries: std.ArrayList(ZipCentralEntry) = .empty;
-    defer entries.deinit(arena);
-
-    var walker = try source_dir.walk(arena);
-    defer walker.deinit();
-
-    var zip_offset: u64 = 0;
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-
-        const rel_name = try normalizeZipPath(arena, entry.path);
-        const file_abs_path = try std.fs.path.join(arena, &.{ source_dir_path, entry.path });
-
-        const stat = try std.Io.Dir.cwd().statFile(io, file_abs_path, .{});
-        const file_crc = try crc32OfFile(io, file_abs_path);
-        const entry_info: ZipCentralEntry = .{
-            .name = rel_name,
-            .crc32 = file_crc,
-            .compressed_size = stat.size,
-            .uncompressed_size = stat.size,
-            .local_offset = zip_offset,
-        };
-
-        try writeZipLocalHeader(&writer.interface, entry_info);
-        try writer.interface.writeAll(rel_name);
-        try writeZipLocalExtra(&writer.interface, entry_info);
-        zip_offset += @sizeOf(std.zip.LocalFileHeader) + rel_name.len + entry_info.localExtraLen();
-
-        try streamFile(io, file_abs_path, &writer.interface);
-        zip_offset += stat.size;
-
-        try entries.append(arena, entry_info);
-    }
-
-    const central_dir_offset = zip_offset;
-    for (entries.items) |entry| {
-        try writeZipCentralHeader(&writer.interface, entry);
-        try writer.interface.writeAll(entry.name);
-        try writeZipCentralExtra(&writer.interface, entry);
-        zip_offset += @sizeOf(std.zip.CentralDirectoryFileHeader) + entry.name.len + entry.centralExtraLen();
-    }
-
-    const central_dir_size = zip_offset - central_dir_offset;
-    const zip64_end_offset = zip_offset;
-    try writeZipEndRecord64(&writer.interface, entries.items.len, central_dir_size, central_dir_offset);
-    zip_offset += @sizeOf(std.zip.EndRecord64);
-    try writeZipEndLocator64(&writer.interface, zip64_end_offset);
-    zip_offset += @sizeOf(std.zip.EndLocator64);
-
-    try writeZipEndRecord(
-        &writer.interface,
-        zipCountLegacy(entries.items.len),
-        zipU32Legacy(central_dir_size),
-        zipU32Legacy(central_dir_offset),
-    );
-    try writer.interface.flush();
-}
-
-fn writePackageArchive(
-    app: *App,
-    source_dir_path: []const u8,
-    output_archive_path: []const u8,
-    archive_type: []const u8,
-) !void {
-    if (std.ascii.eqlIgnoreCase(archive_type, "zip")) {
-        try writeStoreArchive(app.arena, app.io, source_dir_path, output_archive_path);
-        return;
-    }
-
-    if (!try writeArchiveWithTool(app, source_dir_path, output_archive_path, archive_type)) {
-        return error.ArchiveCreateFailed;
-    }
-}
-
-fn writeArchiveWithTool(
-    app: *App,
-    source_dir_path: []const u8,
-    output_archive_path: []const u8,
-    archive_type: []const u8,
-) !bool {
-    deleteBestEffort(app.io, output_archive_path);
-
-    const type_arg = try std.fmt.allocPrint(app.arena, "-t{s}", .{archive_type});
-    const argv = [_][]const u8{
-        app.archive_tool_path.?,
-        "a",
-        type_arg,
-        "-y",
-        output_archive_path,
-        "*",
-    };
-    const result = std.process.run(app.gpa, app.io, .{
-        .argv = &argv,
-        .cwd = .{ .path = source_dir_path },
-    }) catch return false;
-    defer app.gpa.free(result.stdout);
-    defer app.gpa.free(result.stderr);
-    return switch (result.term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
-}
-
-fn normalizeZipPath(arena: Allocator, native_rel: []const u8) ![]const u8 {
-    const out = try arena.dupe(u8, native_rel);
-    std.mem.replaceScalar(u8, out, std.fs.path.sep, '/');
-    return out;
-}
-
-fn crc32OfFile(io: Io, path: []const u8) !u32 {
-    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-
-    var buf: [16 * 1024]u8 = undefined;
-    var reader = file.reader(io, &buf);
-    var hasher = std.hash.Crc32.init();
-
-    var chunk_buf: [16 * 1024]u8 = undefined;
-    while (true) {
-        const amt = reader.interface.readSliceShort(&chunk_buf) catch |e| switch (e) {
-            error.ReadFailed => return reader.err.?,
-        };
-        if (amt == 0) break;
-        hasher.update(chunk_buf[0..amt]);
-    }
-
-    return hasher.final();
-}
-
-fn streamFile(io: Io, path: []const u8, writer: *Io.Writer) !void {
-    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-
-    var reader_buf: [16 * 1024]u8 = undefined;
-    var reader = file.reader(io, &reader_buf);
-    _ = try reader.interface.streamRemaining(writer);
-}
-
-fn writeZipLocalHeader(writer: *Io.Writer, entry: ZipCentralEntry) !void {
-    try writer.writeAll(&std.zip.local_file_header_sig);
-    try writer.writeInt(u16, if (entry.needsZip64()) 45 else 20, .little);
-    try writer.writeInt(u16, 0, .little);
-    try writer.writeInt(u16, @intFromEnum(std.zip.CompressionMethod.store), .little);
-    try writer.writeInt(u16, 0, .little);
-    try writer.writeInt(u16, 0, .little);
-    try writer.writeInt(u32, entry.crc32, .little);
-    try writer.writeInt(u32, zipU32Legacy(entry.compressed_size), .little);
-    try writer.writeInt(u32, zipU32Legacy(entry.uncompressed_size), .little);
-    try writer.writeInt(u16, @intCast(entry.name.len), .little);
-    try writer.writeInt(u16, entry.localExtraLen(), .little);
-}
-
-fn writeZipCentralHeader(writer: *Io.Writer, entry: ZipCentralEntry) !void {
-    try writer.writeAll(&std.zip.central_file_header_sig);
-    try writer.writeInt(u16, if (entry.needsZip64()) 45 else 20, .little);
-    try writer.writeInt(u16, if (entry.needsZip64()) 45 else 20, .little);
-    try writer.writeInt(u16, 0, .little);
-    try writer.writeInt(u16, @intFromEnum(std.zip.CompressionMethod.store), .little);
-    try writer.writeInt(u16, 0, .little);
-    try writer.writeInt(u16, 0, .little);
-    try writer.writeInt(u32, entry.crc32, .little);
-    try writer.writeInt(u32, zipU32Legacy(entry.compressed_size), .little);
-    try writer.writeInt(u32, zipU32Legacy(entry.uncompressed_size), .little);
-    try writer.writeInt(u16, @intCast(entry.name.len), .little);
-    try writer.writeInt(u16, entry.centralExtraLen(), .little);
-    try writer.writeInt(u16, 0, .little);
-    try writer.writeInt(u16, 0, .little);
-    try writer.writeInt(u16, 0, .little);
-    try writer.writeInt(u32, 0, .little);
-    try writer.writeInt(u32, zipU32Legacy(entry.local_offset), .little);
-}
-
-fn writeZipLocalExtra(writer: *Io.Writer, entry: ZipCentralEntry) !void {
-    const data_len = entry.localExtraDataLen();
-    if (data_len == 0) return;
-
-    try writer.writeInt(u16, @intFromEnum(std.zip.ExtraHeader.zip64_info), .little);
-    try writer.writeInt(u16, data_len, .little);
-    try writer.writeInt(u64, entry.uncompressed_size, .little);
-    try writer.writeInt(u64, entry.compressed_size, .little);
-}
-
-fn writeZipCentralExtra(writer: *Io.Writer, entry: ZipCentralEntry) !void {
-    const data_len = entry.centralExtraDataLen();
-    if (data_len == 0) return;
-
-    try writer.writeInt(u16, @intFromEnum(std.zip.ExtraHeader.zip64_info), .little);
-    try writer.writeInt(u16, data_len, .little);
-    try writer.writeInt(u64, entry.uncompressed_size, .little);
-    try writer.writeInt(u64, entry.compressed_size, .little);
-    try writer.writeInt(u64, entry.local_offset, .little);
-}
-
-fn writeZipEndRecord(writer: *Io.Writer, count: u16, central_dir_size: u32, central_dir_offset: u32) !void {
-    try writer.writeAll(&std.zip.end_record_sig);
-    try writer.writeInt(u16, 0, .little);
-    try writer.writeInt(u16, 0, .little);
-    try writer.writeInt(u16, count, .little);
-    try writer.writeInt(u16, count, .little);
-    try writer.writeInt(u32, central_dir_size, .little);
-    try writer.writeInt(u32, central_dir_offset, .little);
-    try writer.writeInt(u16, 0, .little);
-}
-
-fn writeZipEndRecord64(writer: *Io.Writer, count: usize, central_dir_size: u64, central_dir_offset: u64) !void {
-    try writer.writeAll(&std.zip.end_record64_sig);
-    try writer.writeInt(u64, @sizeOf(std.zip.EndRecord64) - 12, .little);
-    try writer.writeInt(u16, 45, .little);
-    try writer.writeInt(u16, 45, .little);
-    try writer.writeInt(u32, 0, .little);
-    try writer.writeInt(u32, 0, .little);
-    try writer.writeInt(u64, count, .little);
-    try writer.writeInt(u64, count, .little);
-    try writer.writeInt(u64, central_dir_size, .little);
-    try writer.writeInt(u64, central_dir_offset, .little);
-}
-
-fn writeZipEndLocator64(writer: *Io.Writer, zip64_end_offset: u64) !void {
-    try writer.writeAll(&std.zip.end_locator64_sig);
-    try writer.writeInt(u32, 0, .little);
-    try writer.writeInt(u64, zip64_end_offset, .little);
-    try writer.writeInt(u32, 1, .little);
-}
-
-fn zipCountLegacy(count: usize) u16 {
-    _ = count;
-    return std.math.maxInt(u16);
-}
-
-fn zipU32Legacy(value: u64) u32 {
-    _ = value;
-    return std.math.maxInt(u32);
 }
